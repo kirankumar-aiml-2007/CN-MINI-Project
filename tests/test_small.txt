@@ -1,0 +1,3 @@
+This is my first TCP file backup test.
+If you can read this on the server,
+the file transfer is working successfully.
