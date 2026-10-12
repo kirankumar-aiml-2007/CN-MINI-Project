@@ -2,6 +2,8 @@
 *.py[cod]
 .venv/
 venv/
+.venv-ryu/
+venv-ryu/
 .env
 .vscode/
 *.save
