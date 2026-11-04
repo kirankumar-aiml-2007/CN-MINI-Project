@@ -1,7 +1,13 @@
 
+from collections import deque
+
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
-from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from os_ken.controller.handler import (
+    CONFIG_DISPATCHER,
+    MAIN_DISPATCHER,
+    set_ev_cls,
+)
 from os_ken.ofproto import ofproto_v1_3
 from os_ken.lib.packet import packet, ethernet
 from os_ken.topology import event
@@ -12,82 +18,195 @@ class SimpleSwitch13(app_manager.OSKenApp):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.mac_to_port = {}
-
-        # Store discovered network topology
         self.switches = set()
         self.links = set()
         self.hosts = {}
         self.datapaths = {}
 
-    # Calculate the shortest path between two switches using BFS
-    def find_path(self, start, end):
+    def get_graph(self):
         graph = {}
 
-        # Build the network graph using discovered links
         for src, src_port, dst, dst_port in self.links:
-            graph.setdefault(src, []).append(dst)
+            graph.setdefault(src, {})[dst] = src_port
+            graph.setdefault(dst, {})[src] = dst_port
 
-        queue = [[start]]
-        visited = set()
+        return graph
+
+    def find_path(self, start, end):
+        graph = self.get_graph()
+        queue = deque([[start]])
+        visited = {start}
 
         while queue:
-            path = queue.pop(0)
+            path = queue.popleft()
             current = path[-1]
 
             if current == end:
                 return path
 
-            if current not in visited:
-                visited.add(current)
-
-                for neighbour in graph.get(current, []):
-                    if neighbour not in visited:
-                        new_path = path + [neighbour]
-                        queue.append(new_path)
+            for neighbour in sorted(graph.get(current, {})):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    queue.append(path + [neighbour])
 
         return None
 
-    # Find the output port connecting two neighbouring switches
     def get_port(self, src_dpid, dst_dpid):
-        for src, src_port, dst, dst_port in self.links:
-            if src == src_dpid and dst == dst_dpid:
-                return src_port
+        return self.get_graph().get(src_dpid, {}).get(dst_dpid)
 
-        return None
+    def is_switch_port(self, dpid, port_no):
+        return port_no in self.get_graph().get(dpid, {}).values()
 
-    # Install forwarding rules along a path between two hosts
+    def learn_host(self, mac, dpid, port_no):
+        if not mac or dpid not in self.datapaths:
+            return False
+
+        ofp = self.datapaths[dpid].ofproto
+
+        if port_no >= ofp.OFPP_MAX:
+            return False
+
+        if self.is_switch_port(dpid, port_no):
+            return False
+
+        first_octet = int(mac.split(":")[0], 16)
+
+        if first_octet & 1:
+            return False
+
+        host_info = (dpid, port_no)
+
+        if self.hosts.get(mac) == host_info:
+            return False
+
+        self.hosts[mac] = host_info
+
+        self.logger.info(
+            "Host learned: %s on switch %s port %s",
+            mac,
+            dpid,
+            port_no
+        )
+
+        return True
+
+    def get_broadcast_tree(self):
+        graph = self.get_graph()
+        nodes = set(graph)
+
+        if not nodes:
+            return set()
+
+        root = min(nodes)
+        visited = {root}
+        queue = deque([root])
+        tree_edges = set()
+
+        while queue:
+            current = queue.popleft()
+
+            for neighbour in sorted(graph.get(current, {})):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    queue.append(neighbour)
+                    tree_edges.add(frozenset((current, neighbour)))
+
+        return tree_edges
+
+    def flood_broadcast(self, msg, dp, in_port):
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+        dpid = dp.id
+
+        graph = self.get_graph()
+        tree_edges = self.get_broadcast_tree()
+
+        switch_ports = set(graph.get(dpid, {}).values())
+        output_ports = set()
+
+        for neighbour, port_no in graph.get(dpid, {}).items():
+            edge = frozenset((dpid, neighbour))
+
+            if edge in tree_edges:
+                output_ports.add(port_no)
+
+        host_ports = set(getattr(dp, "ports", {}).keys()) - switch_ports
+
+        output_ports.update(host_ports)
+        output_ports.discard(in_port)
+
+        actions = [
+            parser.OFPActionOutput(port_no)
+            for port_no in sorted(output_ports)
+            if port_no < ofp.OFPP_MAX
+        ]
+
+        if not actions:
+            return
+
+        data = (
+            msg.data
+            if msg.buffer_id == ofp.OFP_NO_BUFFER
+            else None
+        )
+
+        dp.send_msg(
+            parser.OFPPacketOut(
+                datapath=dp,
+                buffer_id=msg.buffer_id,
+                in_port=in_port,
+                actions=actions,
+                data=data
+            )
+        )
+
+    def add_flow(self, dp, priority, match, actions):
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        instructions = [
+            parser.OFPInstructionActions(
+                ofp.OFPIT_APPLY_ACTIONS,
+                actions
+            )
+        ]
+
+        cookie = 1 if priority == 10 else 0
+
+        dp.send_msg(
+            parser.OFPFlowMod(
+                datapath=dp,
+                cookie=cookie,
+                priority=priority,
+                match=match,
+                instructions=instructions
+            )
+        )
+
     def install_host_path(self, src, dst, src_info, dst_info, path):
-        src_switch, src_port = src_info
+        if not path:
+            return None
+
         dst_switch, dst_port = dst_info
 
-        first_out_port = None
+        for index, current_switch in enumerate(path):
+            dp = self.datapaths.get(current_switch)
 
-        for i in range(len(path)):
-            current_switch = path[i]
-            current_dp = self.datapaths.get(current_switch)
-
-            if current_dp is None:
-                continue
-
-            # Last switch sends packet to destination host
-            if i == len(path) - 1:
-                out_port = dst_port
-            else:
-                next_switch = path[i + 1]
-                out_port = self.get_port(current_switch, next_switch)
-
-            if out_port is None:
-                self.logger.warning(
-                    "Output port not found for switch %s",
-                    current_switch
-                )
+            if dp is None:
                 return None
 
-            if i == 0:
-                first_out_port = out_port
+            if index == len(path) - 1:
+                out_port = dst_port
+            else:
+                out_port = self.get_port(
+                    current_switch,
+                    path[index + 1]
+                )
 
-            parser = current_dp.ofproto_parser
+            if out_port is None:
+                return None
+
+            parser = dp.ofproto_parser
 
             match = parser.OFPMatch(
                 eth_src=src,
@@ -98,34 +217,32 @@ class SimpleSwitch13(app_manager.OSKenApp):
                 parser.OFPActionOutput(out_port)
             ]
 
-            self.add_flow(current_dp, 10, match, actions)
+            self.add_flow(dp, 10, match, actions)
 
-        return first_out_port
+        return True
 
-    # Delete existing priority-10 forwarding rules from all switches
     def delete_forwarding_flows(self):
         for dp in self.datapaths.values():
-            parser, ofp = dp.ofproto_parser, dp.ofproto
+            parser = dp.ofproto_parser
+            ofp = dp.ofproto
 
-            dp.send_msg(parser.OFPFlowMod(
-                datapath=dp,
-                cookie=1,
-                cookie_mask=0xffffffffffffffff,
-                command=ofp.OFPFC_DELETE,
-                table_id=ofp.OFPTT_ALL,
-                out_port=ofp.OFPP_ANY,
-                out_group=ofp.OFPG_ANY,
-                match=parser.OFPMatch(),
-                instructions=[]
-            ))
+            dp.send_msg(
+                parser.OFPFlowMod(
+                    datapath=dp,
+                    cookie=1,
+                    cookie_mask=0xffffffffffffffff,
+                    command=ofp.OFPFC_DELETE,
+                    table_id=ofp.OFPTT_ALL,
+                    out_port=ofp.OFPP_ANY,
+                    out_group=ofp.OFPG_ANY,
+                    match=parser.OFPMatch(),
+                    instructions=[]
+                )
+            )
 
-        self.logger.info("Deleted old forwarding rules")
-
-    # Recalculate and install routes for all discovered host pairs
     def reroute_hosts(self):
-        self.logger.info("Recalculating routes for all hosts")
+        self.logger.info("Recalculating routes")
 
-        # Remove forwarding rules that may use the failed link
         self.delete_forwarding_flows()
 
         for src, src_info in list(self.hosts.items()):
@@ -134,26 +251,34 @@ class SimpleSwitch13(app_manager.OSKenApp):
                 if src == dst:
                     continue
 
-                src_switch = src_info[0]
-                dst_switch = dst_info[0]
-
-                path = self.find_path(src_switch, dst_switch)
+                path = self.find_path(
+                    src_info[0],
+                    dst_info[0]
+                )
 
                 if path is None:
                     self.logger.warning(
-                        "No available path between %s and %s",
-                        src, dst
+                        "No route between %s and %s",
+                        src,
+                        dst
                     )
                     continue
 
-                self.logger.info(
-                    "New route from %s to %s: %s",
-                    src, dst, path
+                result = self.install_host_path(
+                    src,
+                    dst,
+                    src_info,
+                    dst_info,
+                    path
                 )
 
-                self.install_host_path(
-                    src, dst, src_info, dst_info, path
-                )
+                if result:
+                    self.logger.info(
+                        "Route %s -> %s: %s",
+                        src,
+                        dst,
+                        path
+                    )
 
         self.logger.info("Route recalculation completed")
 
@@ -161,9 +286,13 @@ class SimpleSwitch13(app_manager.OSKenApp):
     def switch_features_handler(self, ev):
         dp = ev.msg.datapath
         self.datapaths[dp.id] = dp
+        self.switches.add(dp.id)
 
-        parser, ofp = dp.ofproto_parser, dp.ofproto
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
         match = parser.OFPMatch()
+
         actions = [
             parser.OFPActionOutput(
                 ofp.OFPP_CONTROLLER,
@@ -173,217 +302,231 @@ class SimpleSwitch13(app_manager.OSKenApp):
 
         self.add_flow(dp, 0, match, actions)
 
-    def add_flow(self, dp, priority, match, actions):
-        parser, ofp = dp.ofproto_parser, dp.ofproto
-
-        inst = [
-            parser.OFPInstructionActions(
-                ofp.OFPIT_APPLY_ACTIONS,
-                actions
-            )
-        ]
-
-        cookie = 1 if priority == 10 else 0
-
-        dp.send_msg(parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=priority,
-            match=match,
-            instructions=inst
-        ))
+        self.logger.info("Switch connected: %s", dp.id)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
         dp = msg.datapath
-        parser, ofp = dp.ofproto_parser, dp.ofproto
-        in_port = msg.match['in_port']
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
 
-        eth = packet.Packet(msg.data).get_protocol(ethernet.ethernet)
+        in_port = msg.match["in_port"]
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
 
         if eth is None:
             return
 
-        # Ignore LLDP packets used for topology discovery
         if eth.ethertype == 0x88cc:
             return
 
-        src, dst = eth.src, eth.dst
+        src = eth.src
+        dst = eth.dst
 
-        # Check whether the destination host is known
-        if dst not in self.hosts:
-            actions = [
-                parser.OFPActionOutput(ofp.OFPP_FLOOD)
-            ]
+        if self.learn_host(src, dp.id, in_port):
+            self.reroute_hosts()
 
-            data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
+        first_octet = int(dst.split(":")[0], 16)
 
-            dp.send_msg(parser.OFPPacketOut(
-                datapath=dp,
-                buffer_id=msg.buffer_id,
-                in_port=in_port,
-                actions=actions,
-                data=data
-            ))
+        if first_octet & 1:
+            self.flood_broadcast(msg, dp, in_port)
             return
 
-        if src not in self.hosts:
-            self.logger.warning("Source host %s is not known", src)
+        if src not in self.hosts or dst not in self.hosts:
             return
 
         src_info = self.hosts[src]
         dst_info = self.hosts[dst]
 
-        src_switch = src_info[0]
-        dst_switch = dst_info[0]
-
-        # Calculate the path between the host switches
-        path = self.find_path(src_switch, dst_switch)
-
-        if path is None:
-            self.logger.warning("No path found between hosts")
-            return
-
-        self.logger.info(
-            "Host path from %s to %s: %s",
-            src, dst, path
+        path = self.find_path(
+            src_info[0],
+            dst_info[0]
         )
 
-        # Install forwarding rules along the calculated path
-        out_port = self.install_host_path(
-            src, dst, src_info, dst_info, path
-        )
-
-        if out_port is None:
+        if not path:
+            self.logger.warning(
+                "No path between %s and %s",
+                src,
+                dst
+            )
             return
 
-        # Send the current packet from the first switch
-        if path[0] != dp.id:
+        self.install_host_path(
+            src,
+            dst,
+            src_info,
+            dst_info,
+            path
+        )
+
+        if dp.id not in path:
+            return
+
+        index = path.index(dp.id)
+
+        if index == len(path) - 1:
+            out_port = dst_info[1]
+        else:
+            out_port = self.get_port(
+                dp.id,
+                path[index + 1]
+            )
+
+        if out_port is None or out_port == in_port:
             return
 
         actions = [
             parser.OFPActionOutput(out_port)
         ]
 
-        data = msg.data if msg.buffer_id == ofp.OFP_NO_BUFFER else None
+        data = (
+            msg.data
+            if msg.buffer_id == ofp.OFP_NO_BUFFER
+            else None
+        )
 
-        dp.send_msg(parser.OFPPacketOut(
-            datapath=dp,
-            buffer_id=msg.buffer_id,
-            in_port=in_port,
-            actions=actions,
-            data=data
-        ))
+        dp.send_msg(
+            parser.OFPPacketOut(
+                datapath=dp,
+                buffer_id=msg.buffer_id,
+                in_port=in_port,
+                actions=actions,
+                data=data
+            )
+        )
 
-    # Detect a switch joining the network
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
-        switch = ev.switch
-        dpid = switch.dp.id
+        dp = ev.switch.dp
+        self.switches.add(dp.id)
+        self.logger.info("Switch discovered: %s", dp.id)
 
-        self.switches.add(dpid)
-        self.logger.info("Switch discovered: %s", dpid)
-
-    # Detect a switch leaving the network
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
-        switch = ev.switch
-        dpid = switch.dp.id
+        dpid = ev.switch.dp.id
 
         self.switches.discard(dpid)
+        self.datapaths.pop(dpid, None)
 
-        # Remove links connected to the departed switch
         self.links = {
             link for link in self.links
             if link[0] != dpid and link[2] != dpid
         }
 
-        self.logger.info("Switch left: %s", dpid)
+        self.hosts = {
+            mac: info
+            for mac, info in self.hosts.items()
+            if info[0] != dpid
+        }
 
+        self.logger.warning("Switch disconnected: %s", dpid)
         self.reroute_hosts()
 
-    # Detect a link being added
     @set_ev_cls(event.EventLinkAdd)
     def link_add_handler(self, ev):
         link = ev.link
 
-        src_dpid = link.src.dpid
+        src = link.src.dpid
         src_port = link.src.port_no
-        dst_dpid = link.dst.dpid
+        dst = link.dst.dpid
         dst_port = link.dst.port_no
 
-        link_info = (src_dpid, src_port, dst_dpid, dst_port)
+        link_info = (src, src_port, dst, dst_port)
+        reverse = (dst, dst_port, src, src_port)
 
-        # Ignore duplicate link events
-        if link_info in self.links:
-            return
+        changed = link_info not in self.links
 
         self.links.add(link_info)
+        self.links.add(reverse)
 
-        self.logger.info(
-            "LINK RESTORED: switch %s port %s -> switch %s port %s",
-            src_dpid, src_port, dst_dpid, dst_port
-        )
+        if changed:
+            self.logger.info(
+                "LINK RESTORED: %s <-> %s",
+                src,
+                dst
+            )
+            self.reroute_hosts()
 
-        self.logger.info("Updated network links: %s", self.links)
-
-        # Recalculate routes using the updated topology
-        self.reroute_hosts()
-
-    # Detect a link being removed
     @set_ev_cls(event.EventLinkDelete)
     def link_delete_handler(self, ev):
         link = ev.link
 
-        src_dpid = link.src.dpid
+        src = link.src.dpid
         src_port = link.src.port_no
-        dst_dpid = link.dst.dpid
+        dst = link.dst.dpid
         dst_port = link.dst.port_no
 
-        link_info = (src_dpid, src_port, dst_dpid, dst_port)
-        reverse_link = (dst_dpid, dst_port, src_dpid, src_port)
+        link_info = (src, src_port, dst, dst_port)
+        reverse = (dst, dst_port, src, src_port)
 
-        # Avoid processing the same link failure twice
-        if link_info not in self.links and reverse_link not in self.links:
+        if link_info not in self.links and reverse not in self.links:
             return
 
         self.links.discard(link_info)
-        self.links.discard(reverse_link)
+        self.links.discard(reverse)
 
         self.logger.warning(
-            "LINK FAILURE: switch %s port %s -> switch %s port %s",
-            src_dpid, src_port, dst_dpid, dst_port
+            "LINK FAILURE: %s <-> %s",
+            src,
+            dst
         )
 
-        self.logger.info("Updated network links: %s", self.links)
-
-        # Check whether an alternate path still exists
-        path = self.find_path(src_dpid, dst_dpid)
+        path = self.find_path(src, dst)
 
         if path:
             self.logger.info("Alternate path found: %s", path)
         else:
-            self.logger.warning(
-                "No alternate path between switch %s and switch %s",
-                src_dpid, dst_dpid
-            )
+            self.logger.warning("No alternate path available")
 
-        # Automatically recalculate and install forwarding rules
         self.reroute_hosts()
 
-    # Detect a host joining the network
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        ofp = dp.ofproto
+
+        port_no = msg.desc.port_no
+
+        is_down = (
+            msg.reason == ofp.OFPPR_DELETE
+            or bool(msg.desc.state & ofp.OFPPS_LINK_DOWN)
+        )
+
+        if not is_down:
+            return
+
+        removed = {
+            link for link in self.links
+            if (
+                link[0] == dp.id and link[1] == port_no
+            ) or (
+                link[2] == dp.id and link[3] == port_no
+            )
+        }
+
+        if not removed:
+            return
+
+        self.links.difference_update(removed)
+
+        self.logger.warning(
+            "PORT DOWN: switch %s port %s",
+            dp.id,
+            port_no
+        )
+
+        self.reroute_hosts()
+
     @set_ev_cls(event.EventHostAdd)
     def host_add_handler(self, ev):
         host = ev.host
 
-        mac = host.mac
-        switch = host.port.dpid
-        port = host.port.port_no
-
-        self.hosts[mac] = (switch, port)
-
-        self.logger.info(
-            "Host discovered: %s connected to switch %s port %s",
-            mac, switch, port
-        )
+        if self.learn_host(
+            host.mac,
+            host.port.dpid,
+            host.port.port_no
+        ):
+            self.reroute_hosts()
