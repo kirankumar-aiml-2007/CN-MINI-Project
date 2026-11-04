@@ -129,3 +129,233 @@ def main():
 
 if __name__ == "__main__":
     main()
+import socket
+import os
+import time
+import sys
+
+from protocol.protocol import (
+    BUFFER_SIZE,
+    MAX_FILENAME_SIZE,
+    HEADER_SEPARATOR,
+    TRANSFER_SUCCESS,
+    TRANSFER_FAILED,
+)
+from utils.checksum import calculate_sha256
+
+
+def parse_servers(args):
+    """Convert server arguments into (IP, port) pairs."""
+    servers = []
+
+    for address in args:
+        ip, separator, port_text = address.rpartition(":")
+
+        if not separator:
+            ip = address
+            port = 5000
+        else:
+            if not ip or not port_text:
+                raise ValueError("Invalid server address.")
+            try:
+                port = int(port_text)
+            except ValueError:
+                raise ValueError("Port must be a number.")
+
+        if not ip:
+            raise ValueError("Server IP cannot be empty.")
+
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535.")
+
+        servers.append((ip, port))
+
+    return servers
+
+
+def receive_acknowledgement(sock):
+    """Read a complete success or failure acknowledgement."""
+    expected = (TRANSFER_SUCCESS, TRANSFER_FAILED)
+    max_length = max(len(response) for response in expected)
+    received = bytearray()
+
+    while len(received) < max_length:
+        data = sock.recv(max_length - len(received))
+
+        if not data:
+            break
+
+        received.extend(data)
+        response = bytes(received)
+
+        if response in expected:
+            return response
+
+        if not any(item.startswith(response) for item in expected):
+            break
+
+    return bytes(received)
+
+
+def send_to_server(file_path, filename, file_size, file_hash, ip, port):
+    """Send a file to one backup server."""
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    try:
+        sock.settimeout(30)
+        sock.connect((ip, port))
+
+        # Send file metadata.
+        name_bytes = filename.encode("utf-8")
+
+        header = (
+            f"{len(name_bytes)}|{filename}|{file_size}|{file_hash}"
+        ).encode("utf-8") + HEADER_SEPARATOR
+
+        sock.sendall(header)
+
+        # Stream file data in BUFFER_SIZE pieces.
+        sent = 0
+        start = time.perf_counter()
+
+        with open(file_path, "rb") as file:
+            while True:
+                data = file.read(BUFFER_SIZE)
+
+                if not data:
+                    break
+
+                sock.sendall(data)
+                sent += len(data)
+
+        elapsed = time.perf_counter() - start
+        speed = (
+            (sent / (1024 * 1024)) / elapsed
+            if elapsed > 0 else 0
+        )
+
+        # Detect changes to the file during transmission.
+        if sent != file_size:
+            return False, speed, (
+                f"file size changed during transfer "
+                f"(expected {file_size}, sent {sent})"
+            )
+
+        # Tell the server that no more data will be sent.
+        sock.shutdown(socket.SHUT_WR)
+
+        # Receive the server's integrity-verification result.
+        response = receive_acknowledgement(sock)
+
+        if response == TRANSFER_SUCCESS:
+            return True, speed, "stored and verified"
+
+        if response == TRANSFER_FAILED:
+            return False, speed, "server reported checksum failure"
+
+        return False, speed, "invalid or incomplete server response"
+
+    except ConnectionRefusedError:
+        return False, 0, "server not running"
+
+    except socket.timeout:
+        return False, 0, "connection timed out"
+
+    except ConnectionResetError:
+        return False, 0, "connection reset"
+
+    except OSError as error:
+        return False, 0, f"network/file error: {error}"
+
+    finally:
+        sock.close()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python -m client.client <file_path> [ip:port ...]")
+        print("Examples:")
+        print("  python -m client.client tests/test_small.txt")
+        print(
+            "  python -m client.client tests/test_small.txt "
+            "10.0.0.2:5000 10.0.0.3:5000"
+        )
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+
+    try:
+        servers = parse_servers(sys.argv[2:])
+        servers = servers or [("127.0.0.1", 5000)]
+
+    except ValueError as error:
+        print(f"ERROR: {error}")
+        sys.exit(1)
+
+    if not os.path.isfile(file_path):
+        print(f"ERROR: File not found: {file_path}")
+        sys.exit(1)
+
+    filename = os.path.basename(file_path)
+
+    if len(filename.encode("utf-8")) > MAX_FILENAME_SIZE:
+        print("ERROR: Filename is too long.")
+        sys.exit(1)
+
+    file_size = os.path.getsize(file_path)
+
+    try:
+        file_hash = calculate_sha256(file_path)
+
+    except OSError as error:
+        print(f"ERROR: Could not read file: {error}")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("TCP FILE BACKUP CLIENT (replicating)")
+    print("=" * 60)
+
+    print(f"File    : {file_path} ({file_size} bytes)")
+    print(f"SHA-256 : {file_hash}")
+    print(
+        f"Servers : "
+        f"{', '.join(f'{ip}:{port}' for ip, port in servers)}\n"
+    )
+
+    results = []
+
+    for ip, port in servers:
+        print(f"-> Sending to {ip}:{port} ...")
+
+        ok, speed, message = send_to_server(
+            file_path,
+            filename,
+            file_size,
+            file_hash,
+            ip,
+            port
+        )
+
+        results.append((ip, port, ok, speed, message))
+
+        status = "✓" if ok else "✗"
+        print(f"   {status} {message} ({speed:.2f} MB/s)\n")
+
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    for ip, port, ok, speed, message in results:
+        status = "OK" if ok else "FAIL"
+        print(f"{ip}:{port:<6} {status}  {message}")
+
+    succeeded = sum(1 for result in results if result[2])
+
+    print(f"\n{succeeded}/{len(results)} backups verified")
+
+    sys.exit(0 if succeeded == len(results) else 1)
+
+
+if __name__ == "__main__":
+    main()
